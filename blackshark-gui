@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""BlackShark V2 Pro control GUI (GTK4/libadwaita, one file).
+
+Drives the openrazer daemon: battery status, 10-band equalizer + presets,
+auto power-off timer, mic monitoring (sidetone) and system mic mute.
+"""
+import subprocess
+import threading
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gtk  # noqa: E402
+
+BAND_LABELS = ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
+EQ_PRESETS = {
+    "Flat": [0] * 10,
+    "Bass": [5, 4, 3, 2, 0, 0, 0, 0, 0, 0],
+    "Treble": [0, 0, 0, 0, 0, 0, 2, 3, 4, 5],
+    "V-Shape": [5, 4, 2, 0, -2, -2, 0, 2, 4, 5],
+}
+# The custom curve and the five game-EQ curves live in writable per-preset
+# slots on the device; the GUI reads the active preset's curve live.
+GAME_PRESETS = ("game1", "game2", "game3", "game4", "game5")
+
+
+def find_device():
+    from openrazer.client import DeviceManager
+    for d in DeviceManager().devices:
+        if "BlackShark" in d.name:
+            return d
+    return None
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="BlackShark V2 Pro",
+                         default_width=720, default_height=700)
+        self.device = None
+        self.dev_lock = threading.Lock()
+        self.eq_timeout = None
+        self.sleep_timeout = None
+        self.monitoring_before_mute = False
+        self.updating_ui = False  # guard: setting widget values must not write to device
+
+        self.toasts = Adw.ToastOverlay()
+        self.set_content(self.toasts)
+
+        view = Adw.ToolbarView()
+        self.toasts.set_child(view)
+
+        header = Adw.HeaderBar()
+        self.battery_label = Gtk.Label(label="–")
+        header.pack_end(self.battery_label)
+        view.add_top_bar(header)
+
+        page = Adw.PreferencesPage()
+        view.set_content(page)
+
+        # --- Status ------------------------------------------------------
+        grp = Adw.PreferencesGroup(title="Status")
+        self.status_row = Adw.ActionRow(title="Searching for headset…")
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", valign=Gtk.Align.CENTER)
+        refresh.connect("clicked", lambda *_: self.refresh_all())
+        self.status_row.add_suffix(refresh)
+        grp.add(self.status_row)
+        page.add(grp)
+
+        # --- Equalizer ---------------------------------------------------
+        grp = Adw.PreferencesGroup(title="Equalizer",
+                                   description="On-device 10-band EQ, ±5 dB")
+        self.preset_names = ["game", "music", "movie",
+                             "game1", "game2", "game3", "game4", "game5",
+                             "custom"]
+        self.custom_idx = self.preset_names.index("custom")
+        self.preset_combo = Adw.ComboRow(
+            title="Device preset",
+            subtitle="All presets are stored in the headset",
+            model=Gtk.StringList.new(["Game", "Music", "Movie",
+                                      "Game EQ 1", "Game EQ 2", "Game EQ 3",
+                                      "Game EQ 4", "Game EQ 5", "Custom"]))
+        self.preset_combo.set_selected(self.custom_idx)
+        self.preset_combo.connect("notify::selected", self.on_device_preset)
+        grp.add(self.preset_combo)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                      margin_top=12, margin_bottom=6, homogeneous=True)
+        self.eq_scales = []
+        for label in BAND_LABELS:
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            scale = Gtk.Scale(orientation=Gtk.Orientation.VERTICAL,
+                              adjustment=Gtk.Adjustment(lower=-5, upper=5,
+                                                        step_increment=1, value=0),
+                              inverted=True, draw_value=True, digits=0,
+                              height_request=160)
+            scale.add_mark(0, Gtk.PositionType.RIGHT, None)
+            scale.connect("value-changed", self.on_eq_changed)
+            col.append(scale)
+            col.append(Gtk.Label(label=label, css_classes=["dim-label"]))
+            box.append(col)
+            self.eq_scales.append(scale)
+        self.eq_box = box
+        grp.add(box)
+
+        self.builtin_label = Gtk.Label(
+            label="Game, Music and Movie use a fixed curve stored in the "
+                  "headset — it can't be read out.\nPick Custom or a Game EQ "
+                  "to see and set band values.",
+            wrap=True, justify=Gtk.Justification.CENTER,
+            css_classes=["dim-label"],
+            margin_top=24, margin_bottom=24)
+        self.builtin_label.set_visible(False)
+        grp.add(self.builtin_label)
+
+        presets = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                          margin_bottom=12, halign=Gtk.Align.CENTER)
+        for name in EQ_PRESETS:
+            btn = Gtk.Button(label=name)
+            btn.connect("clicked", self.on_preset, name)
+            presets.append(btn)
+        grp.add(presets)
+
+        page.add(grp)
+
+        # --- Power -------------------------------------------------------
+        grp = Adw.PreferencesGroup(title="Power")
+        self.sleep_row = Adw.SwitchRow(title="Auto power-off",
+                                       subtitle="Turn the headset off when idle")
+        self.sleep_row.connect("notify::active", self.on_sleep_toggle)
+        grp.add(self.sleep_row)
+
+        sleep_scale_row = Adw.ActionRow(title="Power off after")
+        self.sleep_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL,
+                                     adjustment=Gtk.Adjustment(lower=15, upper=60,
+                                                               step_increment=1,
+                                                               value=30),
+                                     draw_value=True, digits=0, hexpand=True,
+                                     valign=Gtk.Align.CENTER, width_request=260)
+        for mark in (15, 30, 45, 60):
+            self.sleep_scale.add_mark(mark, Gtk.PositionType.BOTTOM, f"{mark}m")
+        self.sleep_scale.connect("value-changed", self.on_sleep_minutes)
+        sleep_scale_row.add_suffix(self.sleep_scale)
+        grp.add(sleep_scale_row)
+        page.add(grp)
+
+        # --- Microphone ----------------------------------------------------
+        grp = Adw.PreferencesGroup(title="Microphone")
+        self.mute_row = Adw.SwitchRow(
+            title="Mute microphone",
+            subtitle="Silences your mic for all applications (system mute)")
+        self.mute_row.connect("notify::active", self.on_mic_mute)
+        grp.add(self.mute_row)
+
+        self.mic_row = Adw.SwitchRow(
+            title="Mic monitoring",
+            subtitle="Hear yourself (audible only while an app uses the mic)")
+        self.mic_row.connect("notify::active", self.on_mic_toggle)
+        grp.add(self.mic_row)
+
+        level_row = Adw.ActionRow(title="Monitoring level")
+        self.mic_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL,
+                                   adjustment=Gtk.Adjustment(lower=0, upper=10,
+                                                             step_increment=1, value=7),
+                                   draw_value=True, digits=0, hexpand=True,
+                                   valign=Gtk.Align.CENTER, width_request=220)
+        self.mic_scale.connect("value-changed", self.on_mic_level)
+        level_row.add_suffix(self.mic_scale)
+        grp.add(level_row)
+        page.add(grp)
+
+        # --- Bluetooth -----------------------------------------------------
+        grp = Adw.PreferencesGroup(title="Bluetooth")
+        self.dnd_row = Adw.SwitchRow(
+            title="Do not disturb",
+            subtitle="Suppress Bluetooth interruptions while on 2.4 GHz "
+                     "(stored in the headset)")
+        self.dnd_row.connect("notify::active", self.on_dnd_toggle)
+        grp.add(self.dnd_row)
+        page.add(grp)
+
+        self.refresh_all()
+        GLib.timeout_add_seconds(10, self.tick)
+
+    # --- device helpers ---------------------------------------------------
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
+
+    def dev_write(self, action, on_error=None, on_done=None):
+        """Run a device write off the UI thread (EQ applies take ~0.5 s)."""
+        def worker():
+            try:
+                with self.dev_lock:
+                    action()
+            except Exception as e:
+                GLib.idle_add(self.toast, f"Device error: {e}")
+                if on_error:
+                    GLib.idle_add(on_error)
+            else:
+                if on_done:
+                    GLib.idle_add(on_done)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def refresh_all(self):
+        try:
+            self.device = find_device()
+        except Exception:
+            self.device = None
+        if self.device is None:
+            self.status_row.set_title("Headset not found")
+            self.status_row.set_subtitle("Is the dongle connected and the daemon running?")
+            self.battery_label.set_label("–")
+            return
+
+        d = self.device
+        self.updating_ui = True
+        try:
+            self.status_row.set_title(d.name)
+            self.poll_battery()
+            try:
+                for scale, val in zip(self.eq_scales, d.equalizer):
+                    scale.set_value(val)
+            except Exception:
+                pass
+            try:
+                preset = str(d.equalizer_preset)
+                idx = self.preset_names.index(preset) if preset in self.preset_names else self.custom_idx
+                self.preset_combo.set_selected(idx)
+                self.show_preset(preset)
+            except Exception:
+                pass
+            try:
+                secs = d.get_idle_time()
+                self.sleep_row.set_active(secs > 0)
+                if secs > 0:
+                    self.sleep_scale.set_value(secs // 60)
+            except Exception:
+                pass
+            try:
+                self.mic_row.set_active(bool(d.mic_monitoring))
+                self.mic_scale.set_value(d.mic_monitoring_level)
+            except Exception:
+                pass
+            try:
+                self.dnd_row.set_active(bool(d.bluetooth_dnd))
+            except Exception:
+                pass
+        finally:
+            self.updating_ui = False
+        self.poll_mic_mute()
+
+    def poll_battery(self):
+        if self.device is None:
+            return
+        try:
+            level = int(self.device.battery_level)
+            charging = " ⚡" if self.device.is_charging else ""
+            self.battery_label.set_label(f"🔋 {level}%{charging}")
+            self.status_row.set_subtitle(
+                f"Battery {level}%" + (" — charging" if charging else ""))
+        except Exception:
+            # device vanished (unplugged / passed to a VM); rediscover on next tick
+            self.device = None
+            self.battery_label.set_label("–")
+            self.status_row.set_title("Headset not found")
+            self.status_row.set_subtitle("Reconnecting automatically…")
+
+    def tick(self):
+        """Periodic: refresh battery + preset, rediscover the device if gone."""
+        if self.device is None:
+            self.refresh_all()
+        else:
+            self.poll_battery()
+            self.poll_preset()
+            self.poll_idle()
+        self.poll_mic_mute()
+        return True  # keep the timer running
+
+    def poll_preset(self):
+        """Follow preset changes made with the headset's EQ button."""
+        if self.device is None:
+            return
+        try:
+            preset = str(self.device.equalizer_preset)
+        except Exception:
+            return
+        idx = self.preset_names.index(preset) if preset in self.preset_names else self.custom_idx
+        if self.preset_combo.get_selected() != idx:
+            self.updating_ui = True
+            self.preset_combo.set_selected(idx)
+            self.show_preset(preset)
+            self.updating_ui = False
+            self.load_bands_from_device()
+
+    # --- handlers -----------------------------------------------------------
+
+    def set_sliders_sensitive(self, sensitive):
+        for s in self.eq_scales:
+            s.set_sensitive(sensitive)
+
+    def show_preset(self, preset):
+        """Reflect a preset in the sliders: only custom is editable; the
+        built-in Game/Music/Movie hide the sliders (their curves live in
+        headset ROM and cannot be read out). Band values are loaded
+        separately via load_bands_from_device."""
+        builtin = preset in ("game", "music", "movie")
+        self.eq_box.set_visible(not builtin)
+        self.builtin_label.set_visible(builtin)
+        self.set_sliders_sensitive(preset == "custom")
+
+    def load_bands_from_device(self):
+        """Fill the sliders with the active preset's curve, read live from
+        the headset (custom and each game EQ have their own on-device slot)."""
+        if self.device is None:
+            return False
+        try:
+            values = list(self.device.equalizer)
+        except Exception:
+            return False
+        prev = self.updating_ui
+        self.updating_ui = True
+        for scale, val in zip(self.eq_scales, values):
+            scale.set_value(val)
+        self.updating_ui = prev
+        return False  # one-shot when used as a GLib timeout
+
+    def on_device_preset(self, *_):
+        if self.updating_ui or self.device is None:
+            return
+        d = self.device
+        preset = self.preset_names[self.preset_combo.get_selected()]
+        self.show_preset(preset)
+        # read the newly active preset's curve once the write has finished
+        self.dev_write(lambda: setattr(d, "equalizer_preset", preset),
+                       on_done=self.load_bands_from_device)
+
+    def on_eq_changed(self, *_):
+        if self.updating_ui or self.device is None:
+            return
+        # touching a band implies the custom preset
+        if self.preset_combo.get_selected() != self.custom_idx:
+            self.updating_ui = True
+            self.preset_combo.set_selected(self.custom_idx)
+            self.eq_box.set_visible(True)
+            self.builtin_label.set_visible(False)
+            self.set_sliders_sensitive(True)
+            self.updating_ui = False
+        # debounce: a drag fires many value-changed signals
+        if self.eq_timeout:
+            GLib.source_remove(self.eq_timeout)
+        self.eq_timeout = GLib.timeout_add(400, self.apply_eq)
+
+    def apply_eq(self):
+        self.eq_timeout = None
+        bands = [int(s.get_value()) for s in self.eq_scales]
+        d = self.device
+
+        def write():
+            d.equalizer = bands
+        self.dev_write(write)
+        return False
+
+    def on_preset(self, _btn, name):
+        self.updating_ui = True
+        for scale, val in zip(self.eq_scales, EQ_PRESETS[name]):
+            scale.set_value(val)
+        self.updating_ui = False
+        self.on_eq_changed()
+        # on_eq_changed ignores updating_ui=False with device present; force apply
+        if self.device is not None and self.eq_timeout is None:
+            self.eq_timeout = GLib.timeout_add(50, self.apply_eq)
+
+    def on_sleep_toggle(self, *_):
+        if self.updating_ui or self.device is None:
+            return
+        d = self.device
+        if self.sleep_row.get_active():
+            mins = int(self.sleep_scale.get_value())
+            self.dev_write(lambda: d.set_idle_time(mins * 60))
+        else:
+            self.dev_write(lambda: d.set_idle_time(0))
+
+    def on_sleep_minutes(self, *_):
+        """Slider moved: debounce, then write (enabling the timer if needed)."""
+        if self.updating_ui or self.device is None:
+            return
+        if self.sleep_timeout:
+            GLib.source_remove(self.sleep_timeout)
+        self.sleep_timeout = GLib.timeout_add(500, self.apply_sleep_minutes)
+
+    def apply_sleep_minutes(self):
+        self.sleep_timeout = None
+        if self.device is None:
+            return False
+        d, mins = self.device, int(self.sleep_scale.get_value())
+        if not self.sleep_row.get_active():
+            self.updating_ui = True
+            self.sleep_row.set_active(True)   # moving the slider implies "on"
+            self.updating_ui = False
+        self.dev_write(lambda: d.set_idle_time(mins * 60))
+        return False
+
+    def poll_idle(self):
+        """Follow power-off changes made elsewhere (e.g. Synapse in a VM)."""
+        if self.device is None or self.sleep_timeout is not None:
+            return
+        try:
+            secs = int(self.device.get_idle_time())
+        except Exception:
+            return
+        self.updating_ui = True
+        self.sleep_row.set_active(secs > 0)
+        if secs > 0:
+            self.sleep_scale.set_value(secs // 60)
+        self.updating_ui = False
+
+    def mic_source(self):
+        """Find the BlackShark mic source name in PipeWire."""
+        try:
+            out = subprocess.run(["pactl", "list", "sources", "short"],
+                                 capture_output=True, text=True, timeout=3).stdout
+            for line in out.splitlines():
+                cols = line.split()
+                if len(cols) > 1 and "BlackShark" in cols[1] and ".monitor" not in cols[1]:
+                    return cols[1]
+        except Exception:
+            pass
+        return None
+
+    def on_mic_mute(self, *_):
+        if self.updating_ui:
+            return
+        src = self.mic_source()
+        if src is None:
+            self.toast("Mic source not found")
+            return
+        muted = self.mute_row.get_active()
+        subprocess.run(["pactl", "set-source-mute", src, "1" if muted else "0"],
+                       check=False)
+
+        # The sidetone loop runs inside the headset, so a host mute can't
+        # silence it - couple monitoring to the mute (and restore on unmute).
+        if self.device is None:
+            return
+        d = self.device
+        if muted:
+            self.monitoring_before_mute = self.mic_row.get_active()
+            if self.monitoring_before_mute:
+                self.updating_ui = True
+                self.mic_row.set_active(False)
+                self.updating_ui = False
+                self.dev_write(lambda: setattr(d, "mic_monitoring", False))
+        elif self.monitoring_before_mute:
+            self.monitoring_before_mute = False
+            self.updating_ui = True
+            self.mic_row.set_active(True)
+            self.updating_ui = False
+            self.dev_write(lambda: setattr(d, "mic_monitoring", True))
+
+    def poll_mic_mute(self):
+        """Follow mutes made elsewhere (headset button, sound settings, apps)."""
+        src = self.mic_source()
+        if src is None:
+            return
+        try:
+            out = subprocess.run(["pactl", "get-source-mute", src],
+                                 capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            return
+        muted = "yes" in out.lower() or "ja" in out.lower()
+        if self.mute_row.get_active() != muted:
+            self.updating_ui = True
+            self.mute_row.set_active(muted)
+            self.updating_ui = False
+
+    def on_mic_toggle(self, *_):
+        if self.updating_ui or self.device is None:
+            return
+        d, active = self.device, self.mic_row.get_active()
+        self.dev_write(lambda: setattr(d, "mic_monitoring", active))
+
+    def on_dnd_toggle(self, *_):
+        if self.updating_ui or self.device is None:
+            return
+        d, active = self.device, self.dnd_row.get_active()
+        self.dev_write(lambda: setattr(d, "bluetooth_dnd", active))
+
+    def on_mic_level(self, *_):
+        if self.updating_ui or self.device is None:
+            return
+        d, level = self.device, int(self.mic_scale.get_value())
+        self.dev_write(lambda: setattr(d, "mic_monitoring_level", level))
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="dev.blacksharkv2pro.gui")
+
+    def do_activate(self):
+        win = self.get_active_window()
+        if win is None:
+            win = Window(self)
+            # quit the process when the window closes; otherwise the polling
+            # timers keep a headless instance alive that swallows relaunches
+            win.connect("close-request", self.on_close_request)
+        win.present()
+
+    def on_close_request(self, _win):
+        self.quit()
+        return False
+
+
+if __name__ == "__main__":
+    App().run(None)

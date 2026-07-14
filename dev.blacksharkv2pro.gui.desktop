@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=BlackShark V2 Pro
+Comment=Control the Razer BlackShark V2 Pro headset (EQ, power, mic, Bluetooth)
+Exec=@EXEC@
+Icon=audio-headset
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=razer;headset;equalizer;microphone;battery;
+StartupWMClass=dev.blacksharkv2pro.gui
+SingleMainWindow=true
