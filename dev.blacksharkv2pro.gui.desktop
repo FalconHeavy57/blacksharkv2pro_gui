@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=BlackShark V2 Pro
-Comment=Control the Razer BlackShark V2 Pro headset (EQ, power, mic, Bluetooth)
+Comment=Control the Razer BlackShark V2 Pro headset (EQ, power, sidetone, mic)
 Exec=@EXEC@
 Icon=audio-headset
 Terminal=false

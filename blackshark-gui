@@ -3,7 +3,11 @@
 """BlackShark V2 Pro control GUI (GTK4/libadwaita, one file).
 
 Drives the openrazer daemon: battery status, 10-band equalizer + presets,
-auto power-off timer, mic monitoring (sidetone) and system mic mute.
+auto power-off timer, sidetone, do-not-disturb, system mic mute and the
+headset's own mute-button state. Device identity (serial, firmware, hardware
+id) is in the (i) popover in the header.
+
+Requires the razerblackshark driver and daemon with the sidetone/dnd API.
 """
 import subprocess
 import threading
@@ -25,6 +29,11 @@ EQ_PRESETS = {
 # slots on the device; the GUI reads the active preset's curve live.
 GAME_PRESETS = ("game1", "game2", "game3", "game4", "game5")
 
+# Mic-mute indicator. microphone-disabled-symbolic is the mic with a slash
+# through it; plain audio-input-microphone-symbolic means live.
+MIC_ICON_LIVE = "audio-input-microphone-symbolic"
+MIC_ICON_MUTED = "microphone-disabled-symbolic"
+
 
 def find_device():
     from openrazer.client import DeviceManager
@@ -42,7 +51,12 @@ class Window(Adw.ApplicationWindow):
         self.dev_lock = threading.Lock()
         self.eq_timeout = None
         self.sleep_timeout = None
+        self.mic_timeout = None
         self.monitoring_before_mute = False
+        # Sidetone is one 0-100 value on the device, where 0 means off. The
+        # UI splits it into a switch and a level, so remember the last
+        # non-zero level to restore when the switch goes back on.
+        self.sidetone_level = 70
         self.updating_ui = False  # guard: setting widget values must not write to device
 
         self.toasts = Adw.ToastOverlay()
@@ -53,7 +67,12 @@ class Window(Adw.ApplicationWindow):
 
         header = Adw.HeaderBar()
         self.battery_label = Gtk.Label(label="–")
+        # Info in the left corner; mic-mute state and battery on the right.
+        # pack_end fills from the right, so battery first puts it outermost
+        # and the mic icon lands to its left.
+        header.pack_start(self.build_info_button())
         header.pack_end(self.battery_label)
+        header.pack_end(self.build_mute_button())
         view.add_top_bar(header)
 
         page = Adw.PreferencesPage()
@@ -154,34 +173,132 @@ class Window(Adw.ApplicationWindow):
         grp.add(self.mute_row)
 
         self.mic_row = Adw.SwitchRow(
-            title="Mic monitoring",
+            title="Sidetone",
             subtitle="Hear yourself (audible only while an app uses the mic)")
         self.mic_row.connect("notify::active", self.on_mic_toggle)
         grp.add(self.mic_row)
 
-        level_row = Adw.ActionRow(title="Monitoring level")
+        level_row = Adw.ActionRow(title="Sidetone level")
         self.mic_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL,
-                                   adjustment=Gtk.Adjustment(lower=0, upper=10,
-                                                             step_increment=1, value=7),
+                                   adjustment=Gtk.Adjustment(lower=0, upper=100,
+                                                             step_increment=10, value=70),
                                    draw_value=True, digits=0, hexpand=True,
                                    valign=Gtk.Align.CENTER, width_request=220)
+        for mark in (0, 50, 100):
+            self.mic_scale.add_mark(mark, Gtk.PositionType.BOTTOM, f"{mark}%")
         self.mic_scale.connect("value-changed", self.on_mic_level)
         level_row.add_suffix(self.mic_scale)
         grp.add(level_row)
         page.add(grp)
 
-        # --- Bluetooth -----------------------------------------------------
-        grp = Adw.PreferencesGroup(title="Bluetooth")
+        # --- Do not disturb --------------------------------------------------
+        grp = Adw.PreferencesGroup(title="Do not disturb")
         self.dnd_row = Adw.SwitchRow(
             title="Do not disturb",
-            subtitle="Suppress Bluetooth interruptions while on 2.4 GHz "
-                     "(stored in the headset)")
+            subtitle="Stored in the headset. Synapse lists it with the "
+                     "Bluetooth settings; it does not affect audio or the "
+                     "spoken battery prompts.")
         self.dnd_row.connect("notify::active", self.on_dnd_toggle)
         grp.add(self.dnd_row)
         page.add(grp)
 
         self.refresh_all()
         GLib.timeout_add_seconds(10, self.tick)
+
+    # --- device info ------------------------------------------------------
+
+    #: Rows in the info popover: (label, attribute on the openrazer device).
+    INFO_FIELDS = (
+        ("Model", "name"),
+        ("Serial", "serial"),
+        ("Firmware", "firmware_version"),
+        ("Hardware ID", "hardware_model"),
+        ("Driver", "driver_version"),
+    )
+
+    def build_info_button(self):
+        """An (i) button whose popover shows the device identity read from
+        the headset: serial, firmware and the hardware id it reports for
+        itself (which differs from the dongle's USB id)."""
+        grid = Gtk.Grid(row_spacing=6, column_spacing=18,
+                        margin_top=12, margin_bottom=12,
+                        margin_start=12, margin_end=12)
+        grid.attach(Gtk.Label(label="Device information", xalign=0,
+                              css_classes=["heading"]), 0, 0, 2, 1)
+
+        self.info_values = {}
+        for row, (label, attr) in enumerate(self.INFO_FIELDS, start=1):
+            grid.attach(Gtk.Label(label=label, xalign=0,
+                                  css_classes=["dim-label"]), 0, row, 1, 1)
+            # Deliberately not selectable: the popover focuses its first
+            # focusable child on open, and a focused selectable label shows
+            # up with all its text highlighted. The copy button below covers
+            # getting the values out.
+            value = Gtk.Label(label="–", xalign=0)
+            grid.attach(value, 1, row, 1, 1)
+            self.info_values[attr] = value
+
+        copy_btn = Gtk.Button(label="Copy", halign=Gtk.Align.END,
+                              margin_top=6, css_classes=["flat"],
+                              tooltip_text="Copy these details to the clipboard")
+        copy_btn.connect("clicked", self.on_copy_info)
+        grid.attach(copy_btn, 0, len(self.INFO_FIELDS) + 1, 2, 1)
+
+        popover = Gtk.Popover(child=grid)
+        # help-about-symbolic is the circled "i". Not dialog-information-
+        # symbolic: current Adwaita draws that one as a lightbulb.
+        button = Gtk.MenuButton(icon_name="help-about-symbolic",
+                                popover=popover, valign=Gtk.Align.CENTER,
+                                tooltip_text="Device information")
+        return button
+
+    def on_copy_info(self, _btn):
+        text = "\n".join(
+            f"{label}: {self.info_values[attr].get_label()}"
+            for label, attr in self.INFO_FIELDS)
+        self.get_clipboard().set(text)
+        self.toast("Device details copied")
+
+    def build_mute_button(self):
+        """Mic-mute indicator for the header.
+
+        GTK4 dropped gtk-tooltip-timeout, so a plain tooltip can't be made to
+        appear promptly. Instead this is a MenuButton whose popover is opened
+        on hover as well as on click - autohide is off so hovering doesn't
+        take an input grab, which would fight the pointer leaving again.
+        """
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                      margin_top=10, margin_bottom=10,
+                      margin_start=14, margin_end=14)
+        self.hw_mute_text = Gtk.Label(label="…", xalign=0)
+        box.append(self.hw_mute_text)
+        box.append(Gtk.Label(label="Mute button on the headset", xalign=0,
+                             css_classes=["dim-label", "caption"]))
+
+        popover = Gtk.Popover(child=box, autohide=False)
+        self.hw_mute_button = Gtk.MenuButton(icon_name=MIC_ICON_LIVE,
+                                             popover=popover,
+                                             valign=Gtk.Align.CENTER,
+                                             visible=False)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", lambda *_: self.hw_mute_button.popup())
+        motion.connect("leave", lambda *_: self.hw_mute_button.popdown())
+        self.hw_mute_button.add_controller(motion)
+        return self.hw_mute_button
+
+    def load_info(self):
+        """Fill the info popover. Each value is read independently so one
+        unsupported attribute can't blank the rest."""
+        for attr, widget in self.info_values.items():
+            text = "–"
+            if self.device is not None:
+                try:
+                    value = getattr(self.device, attr)
+                    text = str(value) if value not in (None, "") else "–"
+                except Exception:
+                    # older daemon, or the device doesn't expose this one
+                    text = "not available"
+            widget.set_label(text)
 
     # --- device helpers ---------------------------------------------------
 
@@ -239,17 +356,22 @@ class Window(Adw.ApplicationWindow):
             except Exception:
                 pass
             try:
-                self.mic_row.set_active(bool(d.mic_monitoring))
-                self.mic_scale.set_value(d.mic_monitoring_level)
+                level = int(d.sidetone)
+                self.mic_row.set_active(level > 0)
+                if level > 0:
+                    self.sidetone_level = level
+                self.mic_scale.set_value(self.sidetone_level)
             except Exception:
                 pass
             try:
-                self.dnd_row.set_active(bool(d.bluetooth_dnd))
+                self.dnd_row.set_active(bool(d.dnd))
             except Exception:
                 pass
+            self.load_info()
         finally:
             self.updating_ui = False
         self.poll_mic_mute()
+        self.poll_hw_mute()
 
     def poll_battery(self):
         if self.device is None:
@@ -276,6 +398,7 @@ class Window(Adw.ApplicationWindow):
             self.poll_preset()
             self.poll_idle()
         self.poll_mic_mute()
+        self.poll_hw_mute()
         return True  # keep the timer running
 
     def poll_preset(self):
@@ -451,13 +574,14 @@ class Window(Adw.ApplicationWindow):
                 self.updating_ui = True
                 self.mic_row.set_active(False)
                 self.updating_ui = False
-                self.dev_write(lambda: setattr(d, "mic_monitoring", False))
+                self.dev_write(lambda: setattr(d, "sidetone", 0))
         elif self.monitoring_before_mute:
             self.monitoring_before_mute = False
+            level = self.sidetone_level
             self.updating_ui = True
             self.mic_row.set_active(True)
             self.updating_ui = False
-            self.dev_write(lambda: setattr(d, "mic_monitoring", True))
+            self.dev_write(lambda: setattr(d, "sidetone", level))
 
     def poll_mic_mute(self):
         """Follow mutes made elsewhere (headset button, sound settings, apps)."""
@@ -475,23 +599,64 @@ class Window(Adw.ApplicationWindow):
             self.mute_row.set_active(muted)
             self.updating_ui = False
 
+    def poll_hw_mute(self):
+        """Show the headset's own mute-button state in the header. This is the
+        hardware button on the earcup, separate from the system (PipeWire)
+        mute in the Microphone group - the headset reports it read-only."""
+        if self.device is None:
+            self.hw_mute_button.set_visible(False)
+            return
+        try:
+            muted = bool(self.device.mic_mute)
+        except Exception:
+            self.hw_mute_button.set_visible(False)   # older daemon
+            return
+        self.hw_mute_button.set_visible(True)
+        self.hw_mute_button.set_icon_name(
+            MIC_ICON_MUTED if muted else MIC_ICON_LIVE)
+        self.hw_mute_text.set_label(
+            "Microphone muted on device" if muted
+            else "Microphone not muted on device")
+        # colour the icon red while muted so the state reads at a glance
+        if muted:
+            self.hw_mute_button.add_css_class("error")
+        else:
+            self.hw_mute_button.remove_css_class("error")
+
     def on_mic_toggle(self, *_):
         if self.updating_ui or self.device is None:
             return
-        d, active = self.device, self.mic_row.get_active()
-        self.dev_write(lambda: setattr(d, "mic_monitoring", active))
+        d = self.device
+        level = self.sidetone_level if self.mic_row.get_active() else 0
+        self.dev_write(lambda: setattr(d, "sidetone", level))
 
     def on_dnd_toggle(self, *_):
         if self.updating_ui or self.device is None:
             return
         d, active = self.device, self.dnd_row.get_active()
-        self.dev_write(lambda: setattr(d, "bluetooth_dnd", active))
+        self.dev_write(lambda: setattr(d, "dnd", active))
 
     def on_mic_level(self, *_):
+        """Slider moved: debounce, then write (turning sidetone on if needed)."""
         if self.updating_ui or self.device is None:
             return
+        if self.mic_timeout:
+            GLib.source_remove(self.mic_timeout)
+        self.mic_timeout = GLib.timeout_add(400, self.apply_mic_level)
+
+    def apply_mic_level(self):
+        self.mic_timeout = None
+        if self.device is None:
+            return False
         d, level = self.device, int(self.mic_scale.get_value())
-        self.dev_write(lambda: setattr(d, "mic_monitoring_level", level))
+        if level > 0:
+            self.sidetone_level = level
+            if not self.mic_row.get_active():
+                self.updating_ui = True
+                self.mic_row.set_active(True)   # moving the slider implies "on"
+                self.updating_ui = False
+        self.dev_write(lambda: setattr(d, "sidetone", level))
+        return False
 
 
 class App(Adw.Application):
