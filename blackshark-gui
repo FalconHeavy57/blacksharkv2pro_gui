@@ -9,6 +9,7 @@ id) is in the (i) popover in the header.
 
 Requires the razerblackshark driver and daemon with the sidetone/dnd API.
 """
+import os
 import subprocess
 import threading
 
@@ -477,6 +478,8 @@ class Window(Adw.ApplicationWindow):
 
     def apply_eq(self):
         self.eq_timeout = None
+        if self.device is None:
+            return False
         bands = [int(s.get_value()) for s in self.eq_scales]
         d = self.device
 
@@ -491,9 +494,6 @@ class Window(Adw.ApplicationWindow):
             scale.set_value(val)
         self.updating_ui = False
         self.on_eq_changed()
-        # on_eq_changed ignores updating_ui=False with device present; force apply
-        if self.device is not None and self.eq_timeout is None:
-            self.eq_timeout = GLib.timeout_add(50, self.apply_eq)
 
     def on_sleep_toggle(self, *_):
         if self.updating_ui or self.device is None:
@@ -589,11 +589,13 @@ class Window(Adw.ApplicationWindow):
         if src is None:
             return
         try:
+            # pactl translates "Mute: yes"; LC_ALL=C keeps it parseable
             out = subprocess.run(["pactl", "get-source-mute", src],
-                                 capture_output=True, text=True, timeout=3).stdout
+                                 capture_output=True, text=True, timeout=3,
+                                 env={**os.environ, "LC_ALL": "C"}).stdout
         except Exception:
             return
-        muted = "yes" in out.lower() or "ja" in out.lower()
+        muted = "yes" in out.lower()
         if self.mute_row.get_active() != muted:
             self.updating_ui = True
             self.mute_row.set_active(muted)

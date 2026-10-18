@@ -19,6 +19,12 @@ if ! python3 -c "import gi; gi.require_version('Gtk', '4.0'); gi.require_version
     echo "  Arch:          sudo pacman -S python-gobject gtk4 libadwaita" >&2
     exit 1
 fi
+if ! python3 -c "import gi; gi.require_version('Gtk', '4.0'); gi.require_version('Adw', '1'); from gi.repository import Adw; raise SystemExit(Adw.get_minor_version() < 4)" 2>/dev/null; then
+    echo "ERROR: libadwaita 1.4 or newer is required." >&2
+    echo "  Debian 12 and Ubuntu 22.04 ship older versions;" >&2
+    echo "  Debian 13 or Ubuntu 24.04 (or newer) work." >&2
+    exit 1
+fi
 if ! python3 -c "import openrazer.client" 2>/dev/null; then
     echo "WARNING: the openrazer Python library is not installed." >&2
     echo "  The app will start but won't find the headset until OpenRazer" >&2
